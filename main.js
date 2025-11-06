@@ -26,13 +26,40 @@
   });
 
   // TF モデル読み込み + 前処理パラメータ読み込み
+  // ...existing code...
+  // TF モデル読み込み + 前処理パラメータ読み込み
   async function loadAssets() {
     logs.innerText = 'モデル読み込み中...';
     try {
+      // model.json が存在するかまず確認（model.json の中で参照される shard も Network タブで確認してください）
+      console.log('fetching:', MODEL_URL);
+      const rModel = await fetch(MODEL_URL, { cache: 'no-store' });
+      if (!rModel.ok) throw new Error(`model.json fetch failed: ${rModel.status} ${rModel.statusText}`);
+      const modelText = await rModel.text();
+      console.log('model.json fetched, length:', modelText.length);
+
+      console.log('fetching:', SCALER_URL);
+      const rScaler = await fetch(SCALER_URL, { cache: 'no-store' });
+      if (!rScaler.ok) throw new Error(`scaler.json fetch failed: ${rScaler.status} ${rScaler.statusText}`);
+      const scalerText = await rScaler.text();
+      console.log('scaler.json fetched, length:', scalerText.length);
+
+      console.log('fetching:', LABELS_URL);
+      const rLabels = await fetch(LABELS_URL, { cache: 'no-store' });
+      if (!rLabels.ok) throw new Error(`labels.json fetch failed: ${rLabels.status} ${rLabels.statusText}`);
+      const labelsText = await rLabels.text();
+      console.log('labels.json fetched, length:', labelsText.length);
+
+      logs.innerText = 'ファイル取得成功、TF モデルをロード中...';
+
+      // tf.loadLayersModel は model.json 内で参照する shard (.bin) を自動で fetch します
       model = await tf.loadLayersModel(MODEL_URL);
-      logs.innerText = 'モデル読み込み完了。scaler 読み込み...';
-      scaler = await (await fetch(SCALER_URL)).json();
-      labels = await (await fetch(LABELS_URL)).json();
+      logs.innerText = 'モデル読み込み完了。前処理パラメータ読み込み...';
+
+      // parse scaler/labels
+      scaler = JSON.parse(scalerText);
+      labels = JSON.parse(labelsText);
+
       logs.innerText = 'モデル準備完了。';
       console.log('labels:', labels);
     } catch (err) {
@@ -40,6 +67,7 @@
       logs.innerText = 'モデルまたは前処理パラメータの読み込みに失敗しました。コンソールを確認してください。';
     }
   }
+// ...existing code...
 
   await loadAssets();
 

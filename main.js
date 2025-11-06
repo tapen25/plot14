@@ -1,4 +1,3 @@
-// ...existing code...
 (async () => {
   // model/ファイルの場所（model.json と同階層に web_model フォルダがある想定）
   const MODEL_URL = './web_model/model.json';
@@ -14,15 +13,32 @@
   let scaler = null;
   let labels = null;
 
+  // 先にボタンイベントを登録（モデル読み込みに失敗してもボタンは反応するように）
+  startBtn.addEventListener('click', async () => {
+    startBtn.disabled = true;
+    try {
+      await startMotion();
+    } catch (e) {
+      console.error('startMotion error', e);
+      logs.innerText = 'センサー開始に失敗しました。コンソールを確認してください。';
+      startBtn.disabled = false;
+    }
+  });
+
   // TF モデル読み込み + 前処理パラメータ読み込み
   async function loadAssets() {
     logs.innerText = 'モデル読み込み中...';
-    model = await tf.loadLayersModel(MODEL_URL);
-    logs.innerText = 'モデル読み込み完了。scaler 読み込み...';
-    scaler = await (await fetch(SCALER_URL)).json();
-    labels = await (await fetch(LABELS_URL)).json();
-    logs.innerText = '準備完了。Start を押してください。';
-    console.log('labels:', labels);
+    try {
+      model = await tf.loadLayersModel(MODEL_URL);
+      logs.innerText = 'モデル読み込み完了。scaler 読み込み...';
+      scaler = await (await fetch(SCALER_URL)).json();
+      labels = await (await fetch(LABELS_URL)).json();
+      logs.innerText = 'モデル準備完了。';
+      console.log('labels:', labels);
+    } catch (err) {
+      console.error('loadAssets error', err);
+      logs.innerText = 'モデルまたは前処理パラメータの読み込みに失敗しました。コンソールを確認してください。';
+    }
   }
 
   await loadAssets();
@@ -72,11 +88,11 @@
 
   function standardize(features) {
     // scaler.json には mean と scale 配列がある前提
-    const mean = scaler.mean;
-    const scale = scaler.scale;
+    const mean = scaler?.mean || [];
+    const scale = scaler?.scale || [];
     const out = [];
     for (let i=0;i<features.length;i++){
-      const s = (features[i] - mean[i]) / (scale[i] || 1e-8);
+      const s = (features[i] - (mean[i] || 0)) / (scale[i] || 1e-8);
       out.push(s);
     }
     return out;
@@ -84,39 +100,53 @@
 
   let lastPredTime = 0;
   async function doPredictFromBuffer() {
-    // 推論の頻度を制御（ここでは1秒に1回程度）
+    // モデルやスケーラーが未読み込みなら推論をスキップ
+    if (!model || !scaler || !labels) {
+      const now = Date.now();
+      if (now - lastPredTime > 2000) {
+        logs.innerText = 'モデルが未読み込みのため推論をスキップしています...';
+        lastPredTime = now;
+      }
+      return;
+    }
+
+    // 推論の頻度を制御（ここでは約0.8秒に1回）
     const now = Date.now();
     if (now - lastPredTime < 800) return;
     lastPredTime = now;
 
-    // 特徴量算出→正規化→TF入力
-    const feats = computeFeatures(buffer);
-    const scaled = standardize(feats);
-    const input = tf.tensor2d([scaled]);
-    const out = model.predict(input);
-    const probs = await out.data();
-    input.dispose();
-    out.dispose();
+    try {
+      // 特徴量算出→正規化→TF入力
+      const feats = computeFeatures(buffer);
+      const scaled = standardize(feats);
+      const input = tf.tensor2d([scaled]);
+      const out = model.predict(input);
+      const probs = await out.data();
+      input.dispose();
+      out.dispose();
 
-    // 予測ラベル（確率最大）
-    let maxIdx = 0;
-    for (let i=1;i<probs.length;i++) if (probs[i] > probs[maxIdx]) maxIdx = i;
-    const label = labels[maxIdx]; // labels.json の順序と一致している前提
+      // 予測ラベル（確率最大）
+      let maxIdx = 0;
+      for (let i=1;i<probs.length;i++) if (probs[i] > probs[maxIdx]) maxIdx = i;
+      const label = labels[maxIdx] || 'unknown';
 
-    // ラベルを "5段階" にマッピング（例：Walking->3, Jogging->5, Sitting->1 など）
-    // **重要**: ここはあなたのラベル設計に合わせて調整してください。
-    // 例的に一般的なマップを示します（WISDM のクラスに合わせる）
-    const mapToFive = (lab) => {
-      // lab は labels.json の文字列（例: "Walking","Jogging","Sitting","Standing","Upstairs","Downstairs"）
-      if (lab.toLowerCase().includes('sit') || lab.toLowerCase().includes('standing')) return 1; // 静止寄り
-      if (lab.toLowerCase() === 'walking') return 3;
-      if (lab.toLowerCase() === 'upstairs' || lab.toLowerCase() === 'downstairs') return 3;
-      if (lab.toLowerCase() === 'jogging') return 5;
-      return 3;
-    };
+      // ラベルを "5段階" にマッピング（例）
+      const mapToFive = (lab) => {
+        if (!lab) return 3;
+        const l = lab.toLowerCase();
+        if (l.includes('sit') || l.includes('stand')) return 1;
+        if (l === 'walking') return 3;
+        if (l === 'upstairs' || l === 'downstairs') return 3;
+        if (l === 'jogging' || l === 'running') return 5;
+        return 3;
+      };
 
-    const five = mapToFive(label);
-    updateUI(label, five, probs[maxIdx]);
+      const five = mapToFive(label);
+      updateUI(label, five, probs[maxIdx]);
+    } catch (e) {
+      console.error('prediction error', e);
+      logs.innerText = '推論中にエラーが発生しました。コンソールを確認してください。';
+    }
   }
 
   function updateUI(label, five, confidence) {
@@ -135,26 +165,24 @@
         const res = await DeviceMotionEvent.requestPermission();
         if (res !== 'granted') {
           alert('DeviceMotion permission が必要です。設定を許可してください。');
+          startBtn.disabled = false;
           return;
         }
       } catch (e) {
         console.warn('permission request failed', e);
+        startBtn.disabled = false;
+        return;
       }
     }
-    window.addEventListener('devicemotion', (ev) => {
-      // ev.accelerationIncludingGravity を使用して安定的に値を取得することが多いです
+
+    // イベント登録（重複登録を避ける）
+    const handler = (ev) => {
       const a = ev.accelerationIncludingGravity || ev.acceleration;
       if (!a) return;
       processSample({ x: a.x || 0, y: a.y || 0, z: a.z || 0 });
-    });
+    };
+    window.addEventListener('devicemotion', handler, { passive: true });
     logs.innerText = 'センサー取得中...（スマホを持って歩いてください）';
   }
 
-  // ボタンで開始
-  startBtn.addEventListener('click', async () => {
-    startBtn.disabled = true;
-    await startMotion();
-  });
-
 })();
-// ...existing code...

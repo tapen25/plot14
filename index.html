@@ -1,36 +1,346 @@
-<!doctype html>
+<!DOCTYPE html>
 <html lang="ja">
 <head>
-  <meta charset="utf-8" />
-  <meta name="viewport" content="width=device-width,initial-scale=1" />
-  <title>歩行状態判定（TF.js）</title>
-  <script src="https://cdn.jsdelivr.net/npm/@tensorflow/tfjs@4.12.0/dist/tf.min.js"></script>
-  <style>
-    body { font-family: system-ui, -apple-system, "Hiragino Kaku Gothic ProN", "Noto Sans JP"; padding: 16px; }
-    .status { font-size: 1.6rem; margin-top: 12px; }
-    .bar { display:flex; gap:6px; margin-top:12px; }
-    .dot { width:32px; height:32px; border-radius:50%; background:#ddd; display:inline-block; text-align:center; line-height:32px; }
-    .dot.on { background: #4CAF50; color:white; transform: scale(1.15); }
-    #logs { margin-top:12px; font-size:0.9rem; color:#444; }
-  </style>
+<meta charset="UTF-8">
+<meta name="viewport" content="width=device-width, initial-scale=1.0">
+<title>Filtered Kick & Bass + Graph</title>
+<script src="https://cdnjs.cloudflare.com/ajax/libs/tone/14.8.49/Tone.js"></script>
+<style>
+  body { font-family: sans-serif; padding: 20px; text-align: center; background: #f0f0f0; transition: background 0.5s; user-select: none; }
+  button { padding: 15px 30px; font-size: 1.2em; cursor: pointer; border: none; background: #333; color: white; border-radius: 8px; margin-bottom: 10px; }
+  #status { margin: 10px 0; font-weight: bold; }
+  #debug { color: #666; font-size: 0.8em; margin-bottom: 10px; }
+  
+  /* グラフ用のスタイル */
+  .graph-container {
+    position: relative;
+    width: 90%;
+    max-width: 400px;
+    height: 150px;
+    margin: 0 auto;
+    border: 1px solid #ccc;
+    background: #fff;
+    border-radius: 8px;
+    overflow: hidden;
+  }
+  canvas {
+    width: 100%;
+    height: 100%;
+    display: block;
+  }
+  .legend {
+    font-size: 0.75em;
+    margin-top: 5px;
+    display: flex;
+    justify-content: center;
+    gap: 15px;
+  }
+  .dot { width: 10px; height: 10px; display: inline-block; border-radius: 50%; margin-right: 5px; }
+</style>
 </head>
 <body>
-  <h1>歩行状態判定（オフライン、ブラウザ）</h1>
 
-  <button id="startBtn">開始（DeviceMotion 許可）</button>
-  <div class="status">判定: <span id="predLabel">—</span></div>
+<button id="start">Start (Tap to Play)</button>
+<div id="status">停止中</div>
+<div id="debug">Wait...</div>
 
-  <div class="bar" id="bars">
-    <div class="dot" data-i="0">1</div>
-    <div class="dot" data-i="1">2</div>
-    <div class="dot" data-i="2">3</div>
-    <div class="dot" data-i="3">4</div>
-    <div class="dot" data-i="4">5</div>
-  </div>
+<div class="graph-container">
+  <canvas id="perfGraph" width="400" height="150"></canvas>
+</div>
+<div class="legend">
+  <span><span class="dot" style="background:blue;"></span>User (歩行強度)</span>
+  <span><span class="dot" style="background:red;"></span>System (Filter/音色)</span>
+</div>
 
-  <div id="logs"></div>
+<script>
+// ==========================================
+// 1. シンセ定義
+// ==========================================
+const globalFilter = new Tone.Filter({
+  type: "lowpass",
+  frequency: 200, 
+  Q: 1 
+}).toDestination();
 
-  <!-- main.js を最後に読み込み（DOM が準備されていることを前提） -->
-  <script src="./main.js"></script>
+const polySynth = new Tone.PolySynth(Tone.Synth, {
+  oscillator: { type: "sawtooth" },
+  envelope: { attack: 0.1, decay: 0.2, sustain: 0.5, release: 1 },
+  volume: -5
+}).connect(globalFilter);
+
+const kickSynth = new Tone.MonoSynth({
+  oscillator: { type: "sawtooth" }, 
+  envelope: { attack: 0.01, decay: 0.2, sustain: 0, release: 0.2 },
+  volume: -100 
+}).connect(globalFilter);
+
+const bassSynth = new Tone.MonoSynth({
+  oscillator: { type: "triangle" }, 
+  envelope: { attack: 0.1, decay: 0.5, sustain: 0.8, release: 1 }, 
+  filterEnvelope: { attack: 0.1, baseFrequency: 200, octaves: 1, exponent: 2 },
+  volume: -100 
+}).toDestination();
+
+// ==========================================
+// 変数・設定
+// ==========================================
+let usePatternA = true;
+let isPlaying = false; 
+let currentNoteIndex = 0; 
+
+let currentBPM = 90; 
+let targetBPM = 90; 
+
+let motionHistory = [];
+const HISTORY_DURATION = 1500; 
+const RAMP_TIME = 2; // 少し反応を速めました(可視化のため)
+
+const patterns = {
+  A: ["C4","E4","G4","A4", "G4","A4", "G4","F4", "E4"],
+  B: ["G4","E4","D4","C4", "D4","C4", "D4","E4", "C4"]
+};
+const durations = [0.5, 0.5, 0.5, 0.5, 0.25, 0.25, 0.25, 0.25, 1.0];
+const kickIndices = [0, 2, 4, 8]; 
+const bassMap = { 0: "C3", 2: "E3", 4: "G3", 8: "C4" };
+
+// ==========================================
+// グラフ描画用変数
+// ==========================================
+const canvas = document.getElementById("perfGraph");
+const ctx = canvas.getContext("2d");
+let graphData = []; 
+const MAX_GRAPH_POINTS = 200; // 横軸の解像度
+
+// 現在のセンサー値とターゲット値を保持
+let currentIntensity = 0; 
+let currentFilterVal = 200;
+
+function noteToFreq(note) {
+  const map = {
+    G3: -14, A3: -12, B3: -10,
+    C4: -9,  D4: -7,  E4: -5, F4: -4, G4: -2, A4: 0, B4: 2,
+    C5: 3
+  };
+  let semitone = map[note] || 0;
+  return 440 * Math.pow(2, semitone/12);
+}
+
+document.getElementById("start").onclick = async () => {
+  if (typeof DeviceMotionEvent.requestPermission === 'function') {
+    try {
+      const permissionState = await DeviceMotionEvent.requestPermission();
+      if (permissionState !== 'granted') return alert("拒否されました");
+    } catch (e) { console.error(e); }
+  }
+  await Tone.start();
+  window.addEventListener("devicemotion", handleMotion);
+  
+  // ループ処理開始
+  setInterval(updateBPM, 100); 
+  requestAnimationFrame(drawLoop); // 描画ループ開始
+
+  document.getElementById("status").innerText = "振ってフィルターを開放してください";
+  document.getElementById("start").style.display = "none";
+  document.body.classList.add("active");
+};
+
+function computeMeanStd(arr) {
+  const n = arr.length;
+  if (n === 0) return { mean: 0, std: 0 };
+  const mean = arr.reduce((s, v) => s + v, 0) / n;
+  const varSum = arr.reduce((s, v) => s + (v - mean) * (v - mean), 0) / n;
+  return { mean, std: Math.sqrt(varSum) };
+}
+
+// ==========================================
+// センサー & パラメータ制御
+// ==========================================
+function handleMotion(e) {
+  const acc = e.accelerationIncludingGravity;
+  if (!acc) return;
+
+  const mag = Math.sqrt(acc.x**2 + acc.y**2 + acc.z**2);
+  const now = performance.now();
+
+  motionHistory.push({ time: now, val: mag });
+  motionHistory = motionHistory.filter(item => now - item.time < HISTORY_DURATION);
+
+  const stats = computeMeanStd(motionHistory.map(item => item.val));
+  const intensity = stats.std; 
+  
+  // 閾値処理
+  currentIntensity = intensity < 0.8 ? 0 : intensity;
+
+  targetBPM = mapStdToBPM(currentIntensity);
+  updateFilterAndVol(currentIntensity);
+
+  if (!isPlaying && mag > 13.0) {
+    startSequence();
+  }
+}
+
+function updateBPM() {
+  if (!isPlaying) return;
+  const diff = targetBPM - currentBPM;
+  const step = diff * 0.05; 
+  currentBPM += step;
+  document.getElementById("debug").innerText =
+    `Intensity: ${currentIntensity.toFixed(2)} / BPM: ${Math.floor(currentBPM)}`;
+}
+
+function mapStdToBPM(std) {
+  let bpm = 90 + (std * 4); 
+  if (bpm < 90) bpm = 90;
+  if (bpm > 120) bpm = 120;
+  return bpm;
+}
+
+function updateFilterAndVol(std) {
+  // 1. フィルター周波数
+  const minFreq = 200;  
+  const maxFreq = 1200; // 少しレンジを広げました
+  let targetFreq = 200 + (std * 150); 
+  if (targetFreq < minFreq) targetFreq = minFreq;
+  if (targetFreq > maxFreq) targetFreq = maxFreq;
+  
+  // Tone.jsのランプ機能で滑らかに変化
+  globalFilter.frequency.rampTo(targetFreq, RAMP_TIME);
+
+  // 2. 音量制御
+  let kickVol = -90; 
+  if (std > 2.0) {
+    kickVol = -20 + (std - 2) * 4; 
+    if (kickVol > -5) kickVol = -5; 
+  }
+  kickSynth.volume.rampTo(kickVol, RAMP_TIME);
+
+  let bassVol = -100;
+  if (std > 1.5) { 
+    bassVol = -30 + (std - 1.5) * 4; 
+    if (bassVol > -15) bassVol = -15; 
+  }
+  bassSynth.volume.rampTo(bassVol, RAMP_TIME);
+}
+
+// ==========================================
+// ★グラフ描画ロジック (探索行動の可視化)
+// ==========================================
+function drawLoop() {
+  // 1. 現在の値を保存
+  // Tone.jsのAudioParamは .value で現在の(ランプ中の)値が取れます
+  const actualFilterFreq = globalFilter.frequency.value;
+  
+  // グラフ用に正規化 (0.0 〜 1.0 の範囲に収める)
+  // User: std 0~6 ぐらいを想定
+  let normUser = currentIntensity / 6.0; 
+  if(normUser > 1) normUser = 1;
+
+  // System: 200Hz ~ 1200Hz を想定
+  let normSys = (actualFilterFreq - 200) / 1000;
+  if(normSys < 0) normSys = 0;
+  if(normSys > 1) normSys = 1;
+
+  graphData.push({ user: normUser, sys: normSys });
+  if (graphData.length > MAX_GRAPH_POINTS) {
+    graphData.shift();
+  }
+
+  // 2. 描画クリア
+  ctx.clearRect(0, 0, canvas.width, canvas.height);
+
+  // 3. 背景グリッド
+  ctx.strokeStyle = "#eee";
+  ctx.lineWidth = 1;
+  ctx.beginPath();
+  ctx.moveTo(0, canvas.height * 0.5);
+  ctx.lineTo(canvas.width, canvas.height * 0.5);
+  ctx.stroke();
+
+  if (graphData.length < 2) {
+    requestAnimationFrame(drawLoop);
+    return;
+  }
+
+  // 4. 線を描画する関数
+  function drawLine(prop, color, width) {
+    ctx.beginPath();
+    ctx.strokeStyle = color;
+    ctx.lineWidth = width;
+    
+    // データ点の間隔
+    const stepX = canvas.width / (MAX_GRAPH_POINTS - 1);
+
+    for (let i = 0; i < graphData.length; i++) {
+      const val = graphData[i][prop];
+      // y座標は上が0なので反転 (1.0 - val)
+      const x = i * stepX;
+      const y = canvas.height - (val * canvas.height);
+      
+      if (i === 0) ctx.moveTo(x, y);
+      else ctx.lineTo(x, y);
+    }
+    ctx.stroke();
+  }
+
+  // User (青・細め)
+  drawLine('user', 'blue', 2);
+  
+  // System (赤・太め・少し透明)
+  ctx.globalAlpha = 0.7;
+  drawLine('sys', 'red', 3);
+  ctx.globalAlpha = 1.0;
+
+  requestAnimationFrame(drawLoop);
+}
+
+// ==========================================
+// シーケンス制御 (既存のまま)
+// ==========================================
+function startSequence() {
+  isPlaying = true;
+  currentNoteIndex = 0;
+  playNextNote(); 
+}
+
+function playNextNote() {
+  const currentPattern = usePatternA ? patterns.A : patterns.B;
+  if (currentNoteIndex >= currentPattern.length) {
+    finishSequence();
+    return;
+  }
+  const noteName = currentPattern[currentNoteIndex];
+  const durationVal = durations[currentNoteIndex];
+  const beatDuration = 60 / currentBPM; 
+  const noteTimeLen = beatDuration * durationVal;
+  
+  const freq = noteToFreq(noteName);
+  polySynth.triggerAttackRelease(freq, noteTimeLen);
+
+  if (kickIndices.includes(currentNoteIndex)) {
+    kickSynth.triggerAttackRelease("C2", "8n");
+  }
+  if (bassMap[currentNoteIndex]) {
+    bassSynth.triggerAttackRelease(bassMap[currentNoteIndex], "2n");
+  }
+
+  document.getElementById("status").innerText = 
+    `再生中: ${usePatternA?"A":"B"} (${currentNoteIndex+1}/${currentPattern.length})`;
+
+  setTimeout(() => {
+    currentNoteIndex++;
+    playNextNote(); 
+  }, noteTimeLen * 1000); 
+}
+
+function finishSequence() {
+  isPlaying = false;
+  usePatternA = !usePatternA; 
+  document.getElementById("status").innerText = "待機中...";
+  globalFilter.frequency.rampTo(200, 5);
+  kickSynth.volume.rampTo(-100, 5);
+  bassSynth.volume.rampTo(-100, 5);
+  targetBPM = 90;
+}
+</script>
 </body>
 </html>
